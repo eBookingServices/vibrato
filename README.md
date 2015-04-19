@@ -46,4 +46,4 @@ gauge(cpu_usage, getCPUUsage());
 ```
 
 # notes
-have a look at src/api.d for a list of all options
+Have a look at src/vibrato/api.d for a list of all options
