@@ -1,0 +1,12 @@
+{
+	"name": "vibrato",
+	"description": "Fast Librato.com client for vibe.d with local aggregation",
+	"copyright": "Copyright © 2015, Márcio Martins",
+	"authors": [ "Márcio Martins" ],
+	"license": "MIT License",
+    "targetType": "library",
+	"targetName": "vibrato",
+	"dependencies": {
+		"vibe-d": ">=0.7.23",
+	}
+}
