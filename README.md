@@ -14,10 +14,10 @@ Example usage:
 import vibrato;
 
 enum MyMetrics {
-	cpu_user_time,
-	cpu_usage,
-	page_views,
-	request_time,
+	cpu_user_time = "cpu.user.time",
+	cpu_usage = "cpu.usage",
+	request_count = "request.count",
+	request_time = "request.time",
 }
 
 auto settings = Settings("example@librato.com", "75AFDB82", "frontend.0", "frontend.0.");
@@ -25,25 +25,34 @@ auto settings = Settings("example@librato.com", "75AFDB82", "frontend.0", "front
 init(settings);
 
 // bind metric names
-metric(cpu_user_time, cpu_user_time.stringof, MetricType.Gauge);
-metric(cpu_usage, cpu_usage.stringof, MetricType.Gauge);
-metric(page_views, page_views.stringof, MetricType.Counter);
-metric(request_time, request_time.stringof, MetricType.Gauge);
+registerCounter(cpu_user_time);
+registerCounter(request_count);
+registerCounter(request_time);
+
+registerGauge(cpu_usage);
 
 // start the sending and aggregation thread
 start();
-
 ...
 
-increment(page_views);
+counter(cpu_user_time, getCPUUserTime()); // set absolute value
+gauge(cpu_usage, getCPUUsage());
 
+...
+increment(request_count); // increment by 1
 auto requestTimer = StopWatch(AutoStart.yes);
 ...
 timed(request_time, requestTimer.peek);
-
-...
-gauge(cpu_usage, getCPUUsage());
 ```
 
-# notes
-Have a look at src/vibrato/api.d for a list of all options
+# note
+Gauges can take some flags:
+```d
+enum GaugeFlags : ushort {
+	TimeSeconds			= 1 << 0, // by default time is in msecs
+	NoAggregate			= 1 << 1, // do not aggregate locally - send every sample and it's timestamp untouched
+	AggregateOnlyAvg	= 1 << 2, // compute and send only the average
+	AggregateNoStdDev	= 1 << 3, // compute and send everything (count, min, max, sum, ...), except sum_squares
+	Default = 0,
+}
+```

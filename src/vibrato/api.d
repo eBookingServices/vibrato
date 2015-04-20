@@ -45,19 +45,37 @@ struct Settings {
 }
 
 
-enum MetricType {
-	None = 0,
-	Counter,
-	Gauge,
+private size_t hashOf(const(char)[] x) {
+	size_t hash = 5381;
+	foreach(i; 0..x.length)
+		hash = (hash * 33) ^ cast(size_t)(std.ascii.toLower(x.ptr[i]));
+	return hash;
 }
 
-// max 10 bits (MetricInfo.FlagBits)
-enum MetricFlags {
-	TimeSeconds			= 1 << 0,	// by default time is in msecs
-	NoAggregate			= 1 << 1,	// do not aggregate locally - send every sample directly
-	AggregateOnlyAvg	= 1 << 2,	// compute only the average
-	AggregateNoStdDev	= 1 << 3,	// compute everything (count, min, max, sum, ...), except sum_squares
+
+enum GaugeFlags : ushort {
+	TimeSeconds			= 1 << 0, // by default time is in msecs
+	NoAggregate			= 1 << 1, // do not aggregate locally - send every sample and it's timestamp untouched
+	AggregateOnlyAvg	= 1 << 2, // compute and send only the average
+	AggregateNoStdDev	= 1 << 3, // compute and send everything (count, min, max, sum, ...), except sum_squares
 	Default = 0,
+}
+
+
+struct Annotation {
+	struct Link {
+		string label;
+		string rel;
+		string href;
+	}
+
+	string stream;
+	string title;
+	string description;
+	string source;
+	Link[] links;
+	SysTime start;
+	SysTime end;
 }
 
 
@@ -81,9 +99,13 @@ void init(Settings settings) {
 	annotationsURL_ = "https://" ~ settings_.host ~ "/" ~ settings_.path ~ "/annotations/";
 
 	if (!settings_.prefix.empty) {
-		foreach(ref metric; metrics_) {
-			if (metric.type != MetricType.None)
-				metric.name = settings_.prefix ~ metric.name;
+		foreach(ref counter; hashCounters_) {
+			if (!counter.name.empty)
+				counter.prefixed = settings_.prefix.empty ? counter.name : (settings_.prefix ~ counter.name);
+		}
+		foreach(ref gauge; hashGauges_) {
+			if (!gauge.name.empty)
+				gauge.prefixed = settings_.prefix.empty ? gauge.name : (settings_.prefix ~ gauge.name);
 		}
 	}
 
@@ -94,11 +116,6 @@ void init(Settings settings) {
 
 void start() {
 	assert(!running_);
-
-	dataCounters_[0].length = counters_;
-	dataCounters_[1].length = counters_;
-	dataGauges_[0].length = gauges_;
-	dataGauges_[1].length = gauges_;
 
 	running_ = true;
 	thread_.start();
@@ -118,11 +135,11 @@ void shutdown() {
 		mutex_ = null;
 	}
 
+	hashCounters_.clear;
+	hashGauges_.clear;
+
 	dataGauges_ = null;
 	dataCounters_ = null;
-	metrics_ = null;
-	counters_ = 0;
-	gauges_ = 0;
 }
 
 
@@ -154,23 +171,6 @@ private string libratoError(scope HTTPClientResponse res) {
 	}
 
 	throw new VibratoException(format("Librato.com error: %s", error));
-}
-
-
-struct Annotation {
-	struct Link {
-		string label;
-		string rel;
-		string href;
-	}
-
-	string stream;
-	string title;
-	string description;
-	string source;
-	Link[] links;
-	SysTime start;
-	SysTime end;
 }
 
 
@@ -230,23 +230,53 @@ void annotation(Annotation event) {
 }
 
 
-void metric(size_t index, string name, MetricType type, MetricFlags flags = MetricFlags.Default) {
-	assert(!running_, "cannot call metric() once started");
-	assert(type != MetricType.None);
+void registerCounter(string name) {
+	assert(!running_, "cannot call register() once started");
+	assert(name !in hashGauges_, "'" ~ name ~ "' is already registered as a gauge");
 
-	if (index >= metrics_.length) {
-		auto length = max(64, metrics_.length);
-		while (index >= length) {
-			length = min(length >> 2, length + 64);
-		}
-		metrics_.length = length;
+	auto info = hashCounters_.insert(name);
+	assert(info);
+
+	if (info.name.empty) {
+		info.name = name;
+		info.prefixed = settings_.prefix.empty ? name : (settings_.prefix ~ name);
+		info.slot = cast(ushort)hashCounters_.length;
+
+		dataCounters_[0] ~= 0.0;
+		dataCounters_[1] ~= 0.0;
+	} else {
+		assert(info.name == name);
+		info.prefixed = settings_.prefix.empty ? name : (settings_.prefix ~ name);
 	}
-
-	metrics_[index] = MetricInfo(((thread_ !is null) ? (settings_.prefix ~ name) : name), type, flags, (type == MetricType.Counter) ? counters_++ : gauges_++);
+	assert(dataCounters_[0].length == dataCounters_[1].length);
 }
 
 
-// ok to access settings_ and http_ ungarded as there is no interface to change settings
+void registerGauge(string name, GaugeFlags flags = GaugeFlags.Default) {
+	assert(!running_, "cannot call register() once started");
+	assert(name !in hashCounters_, "'" ~ name ~ "' is already registered as a counter");
+
+	auto info = hashGauges_.insert(name);
+	assert(info);
+
+	if (info.name.empty) {
+		info.name = name;
+		info.prefixed = settings_.prefix.empty ? name : (settings_.prefix ~ name);
+		info.slot = cast(ushort)hashGauges_.length;
+		info.flags = flags;
+
+		++dataGauges_[0].length;
+		++dataGauges_[1].length;
+	} else {
+		assert(info.name == name);
+		info.prefixed = settings_.prefix.empty ? name : (settings_.prefix ~ name);
+		info.flags = flags;
+	}
+	assert(dataGauges_[0].length == dataGauges_[1].length);
+}
+
+
+// ok to access settings_ and ungarded as there is no interface to change settings
 private void sender() {
 	HTTPClient http = connectHTTP(settings_.host, settings_.port, true, settings_.httpSettings);
 
@@ -258,12 +288,13 @@ private void sender() {
 		if (settings_.sendCallback)
 			settings_.sendCallback();
 
-		size_t index = index_;
+		size_t buffer = buffer_;
 		synchronized(mutex_) {
-			index_ = (index_ + 1) & 1;
+			buffer_ = (buffer_ + 1) & 1;
 		}
 
-		size_t measurementCount = 0;
+		auto now = Clock.currTime(UTC()).toUnixTime;
+
 		{
 			json.clear();
 			json.beginObject();
@@ -274,20 +305,13 @@ private void sender() {
 				json.beginArray();
 				scope(exit) json.endArray();
 
-				foreach (ref metric; metrics_) {
-					if (metric.type == MetricType.Counter) {
-						auto slot = metric.slot;
-						auto pvalue = &dataCounters_.ptr[index].ptr[slot];
-						if (*pvalue) {
-							json.beginObject();
-							scope(exit) json.endObject();
+				foreach (ref counter; hashCounters_) {
+					auto pvalue = &dataCounters_.ptr[buffer].ptr[counter.slot];
+					json.beginObject();
+					scope(exit) json.endObject();
 
-							json.field("name").value(metric.name);
-							json.field("value").value(*pvalue);
-							++measurementCount;
-							*pvalue = 0;
-						}
-					}
+					json.field("name").value(counter.prefixed);
+					json.field("value").value(*pvalue);
 				}
 			}
 
@@ -296,90 +320,82 @@ private void sender() {
 				json.beginArray();
 				scope(exit) json.endArray();
 
-				foreach(ref metric; metrics_) {
-					if (metric.type == MetricType.Gauge) {
-						auto slot = metric.slot;
-						auto flags = metric.flags;
-						auto pgauge = &dataGauges_.ptr[index].ptr[metric.slot];
+				foreach(ref gauge; hashGauges_) {
+					auto pgauge = &dataGauges_.ptr[buffer].ptr[gauge.slot];
+					auto flags = gauge.flags;
 
-						// note: these aggregations could well be SSE'd
-						if (!pgauge.values.empty) {
-							if ((flags & MetricFlags.NoAggregate) == 0) {
+					// note: these aggregations could well be SSE'd
+					if (!pgauge.values.empty) {
+						if ((flags & GaugeFlags.NoAggregate) == 0) {
+							json.beginObject();
+							scope(exit) json.endObject();
+
+							json.field("name").value(gauge.prefixed);
+
+							auto vsum = 0.0;
+							auto vsumSq = 0.0;
+							auto vmin = double.max;
+							auto vmax = -double.max;
+							auto count = pgauge.values.length;
+
+							if (flags & GaugeFlags.AggregateOnlyAvg) {
+								foreach(value; pgauge.values)
+									vsum += value;
+								json.field("value").value(vsum / cast(double)count);
+							} else if (flags & GaugeFlags.AggregateNoStdDev) {
+								foreach(value; pgauge.values) {
+									vsum += value;
+									vmin = min(vmin, value);
+									vmax = max(vmax, value);
+								}
+								json.field("count").value(count);
+								json.field("sum").value(vsum);
+								json.field("min").value(vmin);
+								json.field("max").value(vmax);
+							} else {
+								foreach(value; pgauge.values) {
+									vsum += value;
+									vsumSq += value * value;
+									vmin = min(vmin, value);
+									vmax = max(vmax, value);
+								}
+								json.field("count").value(count);
+								json.field("sum").value(vsum);
+								json.field("min").value(vmin);
+								json.field("max").value(vmax);
+								json.field("sum_squares").value(vsumSq);
+							}
+						} else {
+							foreach(i, value; pgauge.values) {
 								json.beginObject();
 								scope(exit) json.endObject();
 
-								json.field("name").value(metric.name);
-
-								auto vsum = 0.0;
-								auto vsumSq = 0.0;
-								auto vmin = double.max;
-								auto vmax = -double.max;
-								auto count = pgauge.values.length;
-
-								if (flags & MetricFlags.AggregateOnlyAvg) {
-									foreach(value; pgauge.values)
-										vsum += value;
-									json.field("value").value(vsum / cast(double)count);
-								} else if (flags & MetricFlags.AggregateNoStdDev) {
-									foreach(value; pgauge.values) {
-										vsum += value;
-										vmin = min(vmin, value);
-										vmax = max(vmax, value);
-									}
-									json.field("count").value(count);
-									json.field("sum").value(vsum);
-									json.field("min").value(vmin);
-									json.field("max").value(vmax);
-								} else {
-									foreach(value; pgauge.values) {
-										vsum += value;
-										vsumSq += value * value;
-										vmin = min(vmin, value);
-										vmax = max(vmax, value);
-									}
-									json.field("count").value(count);
-									json.field("sum").value(vsum);
-									json.field("min").value(vmin);
-									json.field("max").value(vmax);
-									json.field("sum_squares").value(vsumSq);
-								}
-								++measurementCount;
-							} else {
-								foreach(i, value; pgauge.values) {
-									json.beginObject();
-									scope(exit) json.endObject();
-
-									json.field("name").value(metric.name);
-									json.field("measure_time").value(pgauge.times[i].stdTimeToUnixTime);
-									json.field("value").value(value);
-								}
+								json.field("name").value(gauge.prefixed);
+								json.field("value").value(value);
+								json.field("measure_time").value(pgauge.times[i].stdTimeToUnixTime);
 							}
-							pgauge.values.length = 0;
-							pgauge.times.length = 0;
 						}
+						pgauge.values.length = 0;
+						pgauge.times.length = 0;
 					}
 				}
 			}
 
-			if (measurementCount) {
-				json.field("source").value(settings_.source);
-				json.field("measure_time").value(Clock.currTime(UTC()).toUnixTime);
-			}
+			json.field("source").value(settings_.source);
+			json.field("measure_time").value(now);
 		}
 
-		if (measurementCount) {
-			http.request((scope HTTPClientRequest req) {
-				req.method = HTTPMethod.POST;
-				req.requestURL = metricsURL_;
-				req.headers["Content-Type"] = "application/json";
-				req.headers["Authorization"] = auth_;
-				req.bodyWriter.write(json.json);
-			}, (scope HTTPClientResponse res) {
-				if (res.statusCode != HTTPStatus.OK)
-					libratoError(res);
-				res.dropBody();
-			});
-		}
+		http.request((scope HTTPClientRequest req) {
+			req.method = HTTPMethod.POST;
+			req.requestURL = metricsURL_;
+			req.headers["Content-Type"] = "application/json";
+			req.headers["Authorization"] = auth_;
+			req.bodyWriter.write(json.json);
+		}, (scope HTTPClientResponse res) {
+			if (res.statusCode != HTTPStatus.OK)
+				libratoError(res);
+			res.dropBody();
+		});
 	}
 
 	http.disconnect;
@@ -388,53 +404,67 @@ private void sender() {
 }
 
 
-void increment(size_t metric, size_t count = 1) {
+void increment(string name, double count = 1.0) {
 	assert(running_, "cannot increment before start() has been called");
-	assert(metric < metrics_.length, "metric index out of range");
-	assert(metrics_[metric].type == MetricType.Counter, "index is not assigned to a counter metric");
-	
-	auto slot = metrics_.ptr[metric].slot;
-	assert(slot < dataCounters_.length);
 
-	synchronized(mutex_) {
-		dataCounters_.ptr[index_].ptr[slot] += count;
-	}
-}
-
-
-private void gaugei(alias Filter)(size_t metric, double value) {
-	assert(running_, "cannot add gauge value before start() has been called");
-	assert(metric < metrics_.length, "metric index out of range");
-	assert(metrics_[metric].type == MetricType.Gauge, "index is not assigned to a counter metric");
-
-	auto flags = metrics_.ptr[metric].flags;
-	auto slot = metrics_.ptr[metric].slot;
-	assert(slot < dataGauges_.length);
-
-	synchronized(mutex_) {
-		auto pgauge = &dataGauges_.ptr[index_].ptr[slot];
-		pgauge.values ~= Filter(flags, value);
-		if (flags & MetricFlags.NoAggregate) {
-			pgauge.times ~= Clock.currTime(UTC()).stdTime; // converted to unixtime by sender thread
+	if (auto counter = hashCounters_.find(name)) {
+		synchronized(mutex_) {
+			dataCounters_.ptr[buffer_].ptr[counter.slot] += count;
 		}
+	} else {
+		assert(false, "unknown counter metric '" ~ name ~ "'");
 	}
 }
 
 
-void gauge(size_t metric, double value) {
-	gaugei!((f, x) => x)(metric, value);
+void counter(string name, double count) {
+	assert(running_, "cannot set counter before start() has been called");
+
+	if (auto counter = hashCounters_.find(name)) {
+		synchronized(mutex_) {
+			dataCounters_.ptr[buffer_].ptr[counter.slot] = count;
+		}
+	} else {
+		assert(false, "unknown counter metric '" ~ name ~ "'");
+	}
 }
 
-void timed(size_t metric, double milliseconds) {
-	gaugei!((flags, x) => (flags & MetricFlags.TimeSeconds) ? (x * 0.001) : x)(metric, milliseconds);
+
+private void gaugei(alias Filter)(string name, double value) {
+	assert(running_, "cannot add gauge sample before start() has been called");
+
+	if (auto gauge = hashGauges_.find(name)) {
+		auto flags = gauge.flags;
+		synchronized(mutex_) {
+			auto pgauge = &dataGauges_.ptr[buffer_].ptr[gauge.slot];
+			pgauge.values ~= Filter(flags, value);
+			if (flags & GaugeFlags.NoAggregate)
+				pgauge.times ~= Clock.currTime(UTC()).stdTime; // converted to unixtime by sender thread
+		}
+	} else {
+		assert(false, "unknown gauge metric '" ~ name ~ "'");
+	}
 }
 
-void timed(size_t metric, TickDuration duration) {
-	gaugei!((flags, x) => (flags & MetricFlags.TimeSeconds) ? (x * 0.001) : x)(metric, cast(double)duration.msecs);
+
+void gauge(string name, double value) {
+	gaugei!((f, x) => x)(name, value);
 }
 
-void timed(size_t metric, SysTime start, SysTime end) {
-	gaugei!((flags, x) => (flags & MetricFlags.TimeSeconds) ? (x * 0.001) : x)(metric, cast(double)(end - start).total!"msecs");
+void timed(string name, double milliseconds) {
+	gaugei!((flags, x) => (flags & GaugeFlags.TimeSeconds) ? (x * 0.001) : x)(name, milliseconds);
+}
+
+void timed(string name, TickDuration duration) {
+	gaugei!((flags, x) => (flags & GaugeFlags.TimeSeconds) ? (x * 0.001) : x)(name, cast(double)duration.msecs);
+}
+
+void timed(string name, Duration duration) {
+	gaugei!((flags, x) => (flags & GaugeFlags.TimeSeconds) ? (x * 0.001) : x)(name, cast(double)duration.total!"msecs");
+}
+
+void timed(string name, SysTime start, SysTime end) {
+	gaugei!((flags, x) => (flags & GaugeFlags.TimeSeconds) ? (x * 0.001) : x)(name, cast(double)(end - start).total!"msecs");
 }
 
 
@@ -448,47 +478,17 @@ private enum defaultPath = "/v1";
 private enum defaultPort = 443;
 
 
-private struct MetricInfo {
-	this(string name, MetricType type, MetricFlags flags, size_t slot) {
-		assert(slot < (1 << SlotBits));
-		flags_ = slot | (flags << SlotBits) | (type << (SlotBits + FlagBits));
-		name_ = name;
-	}
-
-	private enum {
-		SlotBits	= 20,
-		FlagBits	= 10,
-		TypeBits	= 2,
-	}
-
-	@property MetricType type() const {
-		return cast(MetricType)(flags_ >> (SlotBits + FlagBits));
-	}
-
-	@property MetricFlags flags() const {
-		return cast(MetricFlags)((flags_ >> SlotBits) & ((1 << FlagBits) - 1));
-	}
-
-	@property size_t slot() const {
-		return flags_ & ((1 << SlotBits) - 1);
-	}
-
-	@property string name() const {
-		return name_;
-	}
-
-	@property void name(string name) {
-		name_ = name;
-	}
-
-	private size_t flags_;
-	private string name_;
+private struct GaugeValue {
+	double[] values;
+	long[] times;
 }
 
 
-private shared struct GaugeValue {
-	double[] values;
-	long[] times;
+private struct MetricInfo {
+	ushort slot;
+	ushort flags;
+	string name;
+	string prefixed;
 }
 
 
@@ -499,16 +499,108 @@ private __gshared static {
 	string metricsURL_;
 	string annotationsURL_;
 
-	size_t counters_;
-	size_t gauges_;
-	MetricInfo[] metrics_;
+	MetricMap!MetricInfo hashCounters_;
+	MetricMap!MetricInfo hashGauges_;
 
-	ulong[][2] dataCounters_;
+	double[][2] dataCounters_;
 	GaugeValue[][2] dataGauges_;
 
 	Mutex mutex_;
 	Thread thread_;
 
 	shared bool running_;
-	shared size_t index_;
+	shared size_t buffer_;
+}
+
+
+private struct MetricMap(T) {
+	T* find(string name) {
+		size_t probeCount = metrics_.length;
+		size_t mask = (probeCount - 1);
+		size_t base = hashOf(name) & mask;
+		size_t probe = 0;
+
+		while (probe != probeCount) {
+			size_t index = base + ((probe >> 1) + ((probe * probe) >> 1)) + (probe & 1);
+
+			auto metric = &metrics_[index & mask];
+			if (!metric.name.empty) {
+				if (metric.name == name)
+					return metric;
+				return null;
+			}
+			++probe;
+		}
+		return null;
+	}
+
+	T* insert(string name) {
+		if (count_ >= ((3 * metrics_.length) >> 2)) // ensure at most 75% load
+			grow();
+
+		size_t probeCount = metrics_.length;
+		size_t mask = (probeCount - 1);
+		size_t base = hashOf(name) & mask;
+		size_t probe = 0;
+
+		while (probe != probeCount) {
+			size_t index = base + ((probe >> 1) + ((probe * probe) >> 1)) + (probe & 1);
+
+			auto metric = &metrics_[index & mask];
+			if (metric.name.empty) {
+				++count_;
+				return metric;
+			} else if (metric.name == name) {
+				return metric;
+			}
+
+			++probe;
+		}
+		assert(0);
+	}
+
+	void grow() {
+		T[] metrics;
+
+		const size = max(32, metrics_.length) << 1;
+		const mask = size - 1;
+		metrics.length = size;
+
+		foreach(ref metric; metrics_) {
+			if (!metric.name.empty)
+				metrics[hashOf(metric.name) & mask] = metric;
+		}
+
+		swap(metrics_, metrics);
+	}
+
+	void clear() {
+		count_ = 0;
+		metrics_ = null;
+	}
+
+	@property auto length() const {
+		return count_;
+	}
+
+	@property auto capacity() const {
+		return metrics_.length;
+	}
+
+	T* opIn_r(in string name) {
+        return find(name);
+    }
+
+	int opApply(scope int delegate(ref T) dg) {
+        foreach(ref metric; metrics_) {
+            if (!metric.name.empty) {
+                if (auto res = dg(metric))
+                    return res;
+            }
+        }
+        return 0;
+    }
+
+	private T[] metrics_;
+	private size_t count_;
 }
