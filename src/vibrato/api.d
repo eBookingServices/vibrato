@@ -13,6 +13,8 @@ import std.range;
 import std.socket;
 import std.string;
 
+import vibe.core.core;
+import vibe.core.sync;
 import vibe.data.json;
 import vibe.inet.url;
 import vibe.http.client;
@@ -109,8 +111,7 @@ void init(Settings settings) {
 		}
 	}
 
-	thread_ = new Thread(&sender);
-	mutex_ = new Mutex();
+	mutex_ = new TaskMutex();
 }
 
 
@@ -118,17 +119,12 @@ void start() {
 	assert(!running_);
 
 	running_ = true;
-	thread_.start();
+	runWorkerTask(&sender);
 }
 
 
 void shutdown() {
 	running_ = false;
-	if (thread_ !is null) {
-		thread_.join();
-		thread_.destroy();
-		thread_ = null;
-	}
 
 	if (mutex_ !is null) {
 		mutex_.destroy();
@@ -283,7 +279,7 @@ private void sender() {
 	auto json = jsonWriter(8192);
 
 	while (running_) {
-		Thread.sleep(settings_.intervalSecs.seconds);
+		sleep(settings_.intervalSecs.seconds);
 
 		if (settings_.sendCallback)
 			settings_.sendCallback();
@@ -507,8 +503,7 @@ private __gshared static {
 	double[][2] dataCounters_;
 	GaugeValue[][2] dataGauges_;
 
-	Mutex mutex_;
-	Thread thread_;
+	TaskMutex mutex_;
 
 	shared bool running_;
 	shared size_t buffer_;
