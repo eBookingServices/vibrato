@@ -240,7 +240,7 @@ void registerCounter(string name) {
 	if (info.name.empty) {
 		info.name = name;
 		info.prefixed = settings_.prefix.empty ? name : (settings_.prefix ~ name);
-		info.slot = cast(ushort)hashCounters_.length;
+		info.slot = cast(ushort)(hashCounters_.length - 1);
 
 		dataCounters_[0] ~= 0.0;
 		dataCounters_[1] ~= 0.0;
@@ -262,7 +262,7 @@ void registerGauge(string name, GaugeFlags flags = GaugeFlags.Default) {
 	if (info.name.empty) {
 		info.name = name;
 		info.prefixed = settings_.prefix.empty ? name : (settings_.prefix ~ name);
-		info.slot = cast(ushort)hashGauges_.length;
+		info.slot = cast(ushort)(hashGauges_.length - 1);
 		info.flags = flags;
 
 		++dataGauges_[0].length;
@@ -419,6 +419,7 @@ void increment(string name, double count = 1.0) {
 
 void counter(string name, double count) {
 	assert(running_, "cannot set counter before start() has been called");
+	assert(!name.empty, "counter name must not be empty");
 
 	if (auto counter = hashCounters_.find(name)) {
 		synchronized(mutex_) {
@@ -432,6 +433,7 @@ void counter(string name, double count) {
 
 private void gaugei(alias Filter)(string name, double value) {
 	assert(running_, "cannot add gauge sample before start() has been called");
+	assert(!name.empty, "gauge name must not be empty");
 
 	if (auto gauge = hashGauges_.find(name)) {
 		auto flags = gauge.flags;
@@ -527,6 +529,7 @@ private struct MetricMap(T) {
 			if (!metric.name.empty) {
 				if (metric.name == name)
 					return metric;
+			} else {
 				return null;
 			}
 			++probe;
