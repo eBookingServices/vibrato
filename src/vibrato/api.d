@@ -1,7 +1,6 @@
 module vibrato.api;
 
 
-import core.sync.mutex;
 import core.thread;
 import core.time;
 
@@ -490,7 +489,7 @@ private struct MetricInfo {
 }
 
 
-private __gshared static {
+private __gshared {
 	Settings settings_;
 
 	string auth_;
