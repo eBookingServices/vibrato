@@ -66,11 +66,11 @@ void escapeJSONString(Appender, T)(ref Appender app, T value) if (isSomeString!T
 
 
 private struct JSONFragment {
-    private this(size_t alloc) {
-        json_.reserve(alloc);
+	private this(size_t alloc) {
+		json_.reserve(alloc);
 		states_.reserve(8);
 		states_ ~= StateInfo(States.Ready, 0);
-    }
+	}
 
 	auto ref clear() {
 		json_.clear;
@@ -209,10 +209,10 @@ private struct JSONFragment {
 		return this;
 	}
 
-    @property const(char)[] json() {
+	@property const(char)[] json() {
 		assert((states_.length == 1) && (states_.back.state == States.Finished));
-        return json_.data;
-    }
+		return json_.data;
+	}
 
 	enum States : uint {
 		Ready = 0,
@@ -227,12 +227,12 @@ private struct JSONFragment {
 		uint count;
 	}
 
-    private Appender!(char[]) json_;
+	private Appender!(char[]) json_;
 	private StateInfo[] states_;
 }
 
 
 auto ref jsonWriter(size_t alloc = 2048) {
 	auto frag = JSONFragment(alloc);
-    return frag;
+	return frag;
 }

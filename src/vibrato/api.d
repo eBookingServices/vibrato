@@ -23,13 +23,14 @@ import vibrato.json;
 
 
 class VibratoException : Throwable {
-    this(string msg, string file = __FILE__, size_t line = __LINE__) pure {
-        super(msg, file, line);
-    }
+	this(string msg, string file = __FILE__, size_t line = __LINE__) pure {
+		super(msg, file, line);
+	}
 }
 
 
 alias SendCallback = void delegate();
+alias ErrorCallback	= void delegate(string error);
 
 
 struct Settings {
@@ -39,6 +40,7 @@ struct Settings {
 	string prefix;				// metric name prefix
 	size_t intervalSecs = 10;	// send/aggregate thread sleep cycle
 	SendCallback sendCallback;	// this callback will be called from the sender thread right after waking up, and before aggregation
+	ErrorCallback errorCallback; // this callback will be called from the sender when a librato error occurs i.e. when the api is down
 	HTTPClientSettings httpSettings;	// http client settings
 	string host;				// librato.com's host
 	ushort port;				// librato.com's port
@@ -93,6 +95,10 @@ void init(Settings settings) {
 		settings_.source = Socket.hostName;
 	if (settings_.httpSettings is null)
 		settings_.httpSettings = new HTTPClientSettings;
+	if (settings_.errorCallback is null)
+		settings_.errorCallback = (string error) {
+			throw new Exception(format("Librato.com error: %s", error));
+		};
 
 	auth_ = "Basic " ~ cast(string)Base64.encode(cast(ubyte[])(settings_.user ~ ":" ~ settings_.token));
 
@@ -145,27 +151,29 @@ private string unescapeError(string x) {
 }
 
 
-private string libratoError(scope HTTPClientResponse res) {
-	string error = res.bodyReader.readAllUTF8;
+private void libratoError(scope HTTPClientResponse res) {
+	if (settings_.errorCallback) {
+		string error = res.bodyReader.readAllUTF8;
 
-	if (auto ContentType = "Content-Type" in res.headers) {
-		if ((*ContentType).indexOf("/json") != -1) {
-			auto json = error.parseJsonString;
-			if (auto perrorsJson = "errors" in json) {
-				foreach(string type, errorJson; *perrorsJson) {
-					if (errorJson.type == Json.Type.array) {
-						error = null;
-						foreach(errorLine; errorJson)
-							error ~= (error.length ? "\n" : null) ~ errorLine.get!string.unescapeError;
-					} else if (errorJson.type == Json.Type.string) {
-						error = errorJson.get!string.unescapeError;
+		if (auto ContentType = "Content-Type" in res.headers) {
+			if ((*ContentType).indexOf("/json") != -1) {
+				auto json = error.parseJsonString;
+				if (auto perrorsJson = "errors" in json) {
+					foreach(string type, errorJson; *perrorsJson) {
+						if (errorJson.type == Json.Type.array) {
+							error = null;
+							foreach(errorLine; errorJson)
+								error ~= (error.length ? "\n" : null) ~ errorLine.get!string.unescapeError;
+						} else if (errorJson.type == Json.Type.string) {
+							error = errorJson.get!string.unescapeError;
+						}
 					}
 				}
 			}
 		}
-	}
 
-	throw new VibratoException(format("Librato.com error: %s", error));
+		settings_.errorCallback(error);
+	}
 }
 
 
@@ -513,12 +521,10 @@ private struct MetricMap(T) {
 	T* find(string name) {
 		size_t probeCount = metrics_.length;
 		size_t mask = (probeCount - 1);
-		size_t base = hashOf(name) & mask;
+		size_t index = hashOf(name) & mask;
 		size_t probe = 0;
 
 		while (probe != probeCount) {
-			size_t index = base + ((probe >> 1) + ((probe * probe) >> 1)) + (probe & 1);
-
 			auto metric = &metrics_[index & mask];
 			if (!metric.name.empty) {
 				if (metric.name == name)
@@ -526,7 +532,7 @@ private struct MetricMap(T) {
 			} else {
 				return null;
 			}
-			++probe;
+			index = (index + ++probe) & mask;
 		}
 		return null;
 	}
@@ -537,12 +543,10 @@ private struct MetricMap(T) {
 
 		size_t probeCount = metrics_.length;
 		size_t mask = (probeCount - 1);
-		size_t base = hashOf(name) & mask;
+		size_t index = hashOf(name) & mask;
 		size_t probe = 0;
 
 		while (probe != probeCount) {
-			size_t index = base + ((probe >> 1) + ((probe * probe) >> 1)) + (probe & 1);
-
 			auto metric = &metrics_[index & mask];
 			if (metric.name.empty) {
 				++count_;
@@ -551,7 +555,7 @@ private struct MetricMap(T) {
 				return metric;
 			}
 
-			++probe;
+			index = (index + ++probe) & mask;
 		}
 		assert(0);
 	}
@@ -585,18 +589,18 @@ private struct MetricMap(T) {
 	}
 
 	T* opIn_r(in string name) {
-        return find(name);
-    }
+		return find(name);
+	}
 
 	int opApply(scope int delegate(ref T) dg) {
-        foreach(ref metric; metrics_) {
-            if (!metric.name.empty) {
-                if (auto res = dg(metric))
-                    return res;
-            }
-        }
-        return 0;
-    }
+		foreach(ref metric; metrics_) {
+			if (!metric.name.empty) {
+				if (auto res = dg(metric))
+					return res;
+			}
+		}
+		return 0;
+	}
 
 	private T[] metrics_;
 	private size_t count_;
